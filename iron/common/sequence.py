@@ -124,6 +124,7 @@ class FusedDispatch(SequenceDispatch):
             dependencies=[mlir_artifact] + kernel_objects,
             extra_flags=seq.extra_flags,
             trace_size=seq.trace_size,
+            reconfig_method=seq.reconfig_method,
         )
         seq.add_artifacts([full_elf_artifact])
 
@@ -293,6 +294,14 @@ class OperatorSequence(AIEOperatorBase):
             also runs the operator's CPU reference on the NPU-produced
             inputs and logs the deviation for testing/debugging.  Pass a
             :class:`CompareDispatch` instance to tune the compare tolerances.
+        reconfig_method: Selects the aiecc reconfiguration flags used for the
+            full-ELF build (``dispatch="fused"``/``"auto"`` on NPU2 only; ignored
+            by other dispatch modes). ``None`` (default) keeps today's
+            ``--expand-load-pdis`` behaviour. ``"loadpdi"`` uses native
+            load_pdi (drops ``--expand-load-pdis``, no ``--reconfig-method``).
+            ``"write32"``/``"ctrlpkt"`` pass ``--reconfig-method=X``. See
+            ``iron/common/compilation/base.py``'s
+            ``_full_elf_reconfig_options`` for the exact option lists.
     """
 
     def __init__(
@@ -306,10 +315,16 @@ class OperatorSequence(AIEOperatorBase):
         extra_flags=None,
         trace_size=0,
         share_designs=False,
+        reconfig_method=None,
         *args,
         **kwargs,
     ):
         dispatch = self._coerce_dispatch(dispatch)
+        if reconfig_method not in comp._RECONFIG_METHODS:
+            raise ValueError(
+                f"reconfig_method={reconfig_method!r} is not supported; expected "
+                f"one of {comp._RECONFIG_METHODS}"
+            )
         if not all(
             isinstance(op, MLIROperator) and all(isinstance(buf, str) for buf in bufs)
             for op, *bufs in runlist
@@ -333,6 +348,9 @@ class OperatorSequence(AIEOperatorBase):
         # Bytes of hardware trace buffer per runlist step; 0 leaves the design untraced.
         self.trace_size = trace_size
         self.share_designs = share_designs
+        # Selects the full-ELF build's aiecc reconfiguration flags; see
+        # FusedDispatch.set_up_artifacts / AieccFullElfCompilationRule.
+        self.reconfig_method = reconfig_method
         self._dispatch = dispatch
 
     @staticmethod

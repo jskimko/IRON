@@ -12,6 +12,7 @@ from .base import (
     SourceArtifact,
     MLIRArtifact,
     FullElfArtifact,
+    _RECONFIG_METHODS,
     XclbinArtifact,
     InstsBinArtifact,
     KernelObjectArtifact,

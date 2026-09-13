@@ -337,6 +337,7 @@ class FullElfArtifact(_MLIRInputMixin, CompilationArtifact):
         dependencies: list[CompilationArtifact],
         extra_flags: list[str] | None = None,
         trace_size: int = 0,
+        reconfig_method: str | None = None,
     ) -> None:
         if mlir_input not in dependencies:
             dependencies = dependencies + [mlir_input]
@@ -344,6 +345,10 @@ class FullElfArtifact(_MLIRInputMixin, CompilationArtifact):
         self.extra_flags = extra_flags if extra_flags is not None else []
         # Bytes of trace buffer per runlist step, 0 for an untraced build.
         self.trace_size = trace_size
+        # Selects which reconfiguration flags AieccFullElfCompilationRule passes to
+        # aiecc; see that rule for the mode table. None keeps today's A-expand
+        # behaviour byte-identical.
+        self.reconfig_method = reconfig_method
 
 
 class XclbinArtifact(_MLIRInputMixin, CompilationArtifact):
@@ -624,6 +629,33 @@ class AieccCompilationRule(CompilationRule):
         super().__init__(*args, **kwargs)
 
 
+_RECONFIG_METHODS = (None, "loadpdi", "write32", "ctrlpkt")
+
+
+def _full_elf_reconfig_options(reconfig_method: str | None) -> list[str]:
+    """The aiecc reconfiguration flags for a FullElfArtifact's ``reconfig_method``.
+
+    - None (default): ``--expand-load-pdis --get-scratchpad-parameters``
+      (A-expand, byte-identical to the pre-``reconfig_method`` behaviour).
+    - "loadpdi": drop ``--expand-load-pdis``; keep
+      ``--get-scratchpad-parameters``; no ``--reconfig-method`` (A-loadpdi,
+      native load_pdi).
+    - "write32"/"ctrlpkt": ``--reconfig-method=X --get-scratchpad-parameters``
+      (``--expand-load-pdis`` dropped; ``--get-full-elf`` is already added by
+      the full-elf build path).
+    """
+    if reconfig_method not in _RECONFIG_METHODS:
+        raise ValueError(
+            f"reconfig_method={reconfig_method!r} is not supported; expected one "
+            f"of {_RECONFIG_METHODS}"
+        )
+    if reconfig_method is None:
+        return ["--expand-load-pdis", "--get-scratchpad-parameters"]
+    if reconfig_method == "loadpdi":
+        return ["--get-scratchpad-parameters"]
+    return [f"--reconfig-method={reconfig_method}", "--get-scratchpad-parameters"]
+
+
 class AieccFullElfCompilationRule(AieccCompilationRule):
     def matches(self, graph):
         return any(graph.get_worklist(FullElfArtifact))
@@ -637,8 +669,7 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
             work_dir = _aiecc_work_dir(mlir_source.filename)
             options = [
                 f"-j{os.environ.get('AIECC_JOBS', '1')}",
-                "--expand-load-pdis",
-                "--get-scratchpad-parameters",
+                *_full_elf_reconfig_options(artifact.reconfig_method),
             ] + artifact.extra_flags
             if artifact.trace_size:
                 # The trace parser reads the lowered module for the buffer layout
