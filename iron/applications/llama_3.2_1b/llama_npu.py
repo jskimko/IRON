@@ -60,9 +60,13 @@ class AIEDecodeOperations:
 
 class AIELlamaOperators:
 
-    def __init__(self, config, prompt_len, reconfig_method=None):
+    def __init__(self, config, prompt_len, reconfig_method=None, decode_prefix_n=None):
         self.context = AIEContext()
         self.context.build_dir.mkdir(parents=True, exist_ok=True)
+        # Correctness stress-testing: when set, the fused decode operator is built
+        # from only the first N runlist entries (reconfig_prefix_correctness.py), so
+        # a real reconfiguration prefix can be checked op-by-op against a reference.
+        self.decode_prefix_n = decode_prefix_n
         # Reconfiguration delivery method for the fused decode ELF build; see
         # OperatorSequence(reconfig_method=...). None keeps the shipped
         # --expand-load-pdis behaviour (A-expand). Non-None methods build into a
@@ -280,13 +284,18 @@ class AIELlamaOperators:
         # Decode operator (everything temporally fused)
         # ##################################################################
 
-        elf_ctx = AIEContext(
-            build_dir=(
-                "build_elf"
-                if reconfig_method is None
-                else f"build_elf/{reconfig_method}"
-            )
-        )
+        # Per-(method, prefix) build dir so a distinct ELF never collides on the
+        # shared "fused_op.elf" name with the mtime cache (a stale full-model ELF
+        # would otherwise be loaded for a different layout -> device crash). The
+        # shipped full-model A-expand keeps the bare "build_elf".
+        if reconfig_method is None and decode_prefix_n is None:
+            build_dir = "build_elf"
+        else:
+            parts = [reconfig_method or "expand"]
+            if decode_prefix_n is not None:
+                parts.append(f"prefix{decode_prefix_n}")
+            build_dir = "build_elf/" + "_".join(parts)
+        elf_ctx = AIEContext(build_dir=build_dir)
 
         gemv_attn_query_op = GEMV(
             M=config.n_heads * config.head_dim,
@@ -566,88 +575,113 @@ class AIELlamaOperators:
             (gemv_out_head_op, "W_out_head", "x", "logits"),
         ]
 
+        # arguments that change between invocations of the fused kernel and
+        # therefore need to be synced on each token
+        input_args = ["x", "rope_angles"]
+        output_args = ["logits"]
+        buffer_sizes = {
+            **{
+                f"keys_cache_{layer_idx}": cache_buffer_size
+                for layer_idx in range(config.n_layers)
+            },
+            **{
+                f"values_cache_{layer_idx}": cache_buffer_size
+                for layer_idx in range(config.n_layers)
+            },
+            "attn_scores_values": values_buffer_size,
+            "attn_scores_values_transposed": values_buffer_size,
+        }
+        # Prefix truncation for correctness stress-testing: keep the first N entries
+        # and recompute the sequence's I/O from the ops that survive (the full
+        # output "logits" is produced only by the final op; unused explicit sizes
+        # and the "rope_angles" input drop out cleanly).
+        if decode_prefix_n is not None:
+            runlist = runlist[:decode_prefix_n]
+            prefix_bufs = {b for _op, *bufs in runlist for b in bufs}
+            input_args = [a for a in input_args if a in prefix_bufs]
+            output_args = [runlist[-1][-1]]  # last kept op's output buffer
+            buffer_sizes = {k: v for k, v in buffer_sizes.items() if k in prefix_bufs}
+        self.decode.prefix_runlist = runlist
+
         self.decode.fused_op = OperatorSequence(
             "fused_op",
             runlist,
-            input_args=[  # arguments that change between invocations of the fused kernel and therefore need to be synced on each token
-                "x",
-                "rope_angles",
-            ],
-            output_args=["logits"],
+            input_args=input_args,
+            output_args=output_args,
             reconfig_method=reconfig_method,
-            buffer_sizes={
-                **{
-                    f"keys_cache_{layer_idx}": cache_buffer_size
-                    for layer_idx in range(config.n_layers)
-                },
-                **{
-                    f"values_cache_{layer_idx}": cache_buffer_size
-                    for layer_idx in range(config.n_layers)
-                },
-                **{
-                    "attn_scores_values": values_buffer_size,
-                    "attn_scores_values_transposed": values_buffer_size,
-                },
-            },
+            buffer_sizes=buffer_sizes,
             context=elf_ctx,
         ).compile()
 
         self.decode.fused = self.decode.fused_op.get_callable()
 
-        # Operator static buffers (weights, LUTs)
+        # Operator static buffers (weights, LUTs). A truncated prefix
+        # (decode_prefix_n) contains only a subset of these buffers, so skip any
+        # weight whose buffer is not in the built sequence's layout.
+        layout = self.decode.fused_op.subbuffer_layout
+
+        def set_static(name, value):
+            if name in layout:
+                self.decode.fused.get_buffer(name).torch_view()[:] = value
 
         for layer_idx in range(config.n_layers):
-            self.decode.fused.get_buffer(f"W_norm1_{layer_idx}").torch_view()[:] = (
+            set_static(
+                f"W_norm1_{layer_idx}",
                 config.weights[
                     f"model.layers.{layer_idx}.input_layernorm.weight"
-                ].flatten()
+                ].flatten(),
             )
-            self.decode.fused.get_buffer(f"W_attn_query_{layer_idx}").torch_view()[
-                :
-            ] = config.weights[
-                f"model.layers.{layer_idx}.self_attn.q_proj.weight"
-            ].flatten()
-            self.decode.fused.get_buffer(f"W_attn_key_{layer_idx}").torch_view()[:] = (
+            set_static(
+                f"W_attn_query_{layer_idx}",
+                config.weights[
+                    f"model.layers.{layer_idx}.self_attn.q_proj.weight"
+                ].flatten(),
+            )
+            set_static(
+                f"W_attn_key_{layer_idx}",
                 config.weights[
                     f"model.layers.{layer_idx}.self_attn.k_proj.weight"
-                ].flatten()
+                ].flatten(),
             )
-            self.decode.fused.get_buffer(f"W_attn_value_{layer_idx}").torch_view()[
-                :
-            ] = config.weights[
-                f"model.layers.{layer_idx}.self_attn.v_proj.weight"
-            ].flatten()
-            self.decode.fused.get_buffer(
-                f"W_attn_output_decode_{layer_idx}"
-            ).torch_view()[:] = config.weights[
-                f"model.layers.{layer_idx}.self_attn.o_proj.weight"
-            ].flatten()
-            self.decode.fused.get_buffer(f"W_norm2_{layer_idx}").torch_view()[:] = (
+            set_static(
+                f"W_attn_value_{layer_idx}",
+                config.weights[
+                    f"model.layers.{layer_idx}.self_attn.v_proj.weight"
+                ].flatten(),
+            )
+            set_static(
+                f"W_attn_output_decode_{layer_idx}",
+                config.weights[
+                    f"model.layers.{layer_idx}.self_attn.o_proj.weight"
+                ].flatten(),
+            )
+            set_static(
+                f"W_norm2_{layer_idx}",
                 config.weights[
                     f"model.layers.{layer_idx}.post_attention_layernorm.weight"
-                ].flatten()
+                ].flatten(),
             )
-            self.decode.fused.get_buffer(f"W_ffn_gate_{layer_idx}").torch_view()[:] = (
+            set_static(
+                f"W_ffn_gate_{layer_idx}",
                 config.weights[
                     f"model.layers.{layer_idx}.mlp.gate_proj.weight"
-                ].flatten()
+                ].flatten(),
             )
-            self.decode.fused.get_buffer(f"W_ffn_up_{layer_idx}").torch_view()[:] = (
-                config.weights[f"model.layers.{layer_idx}.mlp.up_proj.weight"].flatten()
+            set_static(
+                f"W_ffn_up_{layer_idx}",
+                config.weights[f"model.layers.{layer_idx}.mlp.up_proj.weight"].flatten(),
             )
-            self.decode.fused.get_buffer(f"W_ffn_down_{layer_idx}").torch_view()[:] = (
+            set_static(
+                f"W_ffn_down_{layer_idx}",
                 config.weights[
                     f"model.layers.{layer_idx}.mlp.down_proj.weight"
-                ].flatten()
+                ].flatten(),
             )
         scale_factor = 1.0 / math.sqrt(config.head_dim)
-        self.decode.fused.get_buffer("attn_scale_factor").fill_(scale_factor)
-        self.decode.fused.get_buffer("W_final_norm").torch_view()[:] = config.weights[
-            "model.norm.weight"
-        ].flatten()
-        self.decode.fused.get_buffer("W_out_head").torch_view()[:] = config.weights[
-            "model.embed_tokens.weight"
-        ].flatten()
+        if "attn_scale_factor" in layout:
+            self.decode.fused.get_buffer("attn_scale_factor").fill_(scale_factor)
+        set_static("W_final_norm", config.weights["model.norm.weight"].flatten())
+        set_static("W_out_head", config.weights["model.embed_tokens.weight"].flatten())
         self.decode.fused.input_buffer.to("npu")
         self.decode.fused.scratch_buffer.to("npu")
         self.decode.fused.output_buffer.to("npu")
