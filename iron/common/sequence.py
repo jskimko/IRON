@@ -173,10 +173,16 @@ class FusedDispatch(SequenceDispatch):
         return kernel_artifacts
 
     def make_callable(self, seq):
-        # loadpdi_union/write32/ctrlpkt build a union ELF (--reconfig-method) whose
-        # schedule is per-config entrypoints dispatched via pyxrt.runlist. None
-        # (expand) and "loadpdi" keep the single baked main:sequence entry.
-        if seq.reconfig_method in ("loadpdi_union", "write32", "ctrlpkt"):
+        # loadpdi_union/write32/ctrlpkt(_parallel) build a union ELF
+        # (--reconfig-method) whose schedule is per-config entrypoints dispatched
+        # via pyxrt.runlist. None (expand) and "loadpdi" keep the single baked
+        # main:sequence entry.
+        if seq.reconfig_method in (
+            "loadpdi_union",
+            "write32",
+            "ctrlpkt",
+            "ctrlpkt_parallel",
+        ):
             return SequenceUnionRunlistCallable(seq)
         return SequenceFullELFCallable(seq)
 
@@ -879,9 +885,9 @@ class SequenceUnionRunlistCallable(_ConsolidatedBufferCallable):
         self._xrt_context = pyxrt.hw_context(
             aie_utils.DefaultNPURuntime._device, self._xrt_elf
         )
-        # ctrlpkt is the only method whose entries carry a control-packet slot
-        # and that needs the main:init overlay standup prepended.
-        self._needs_ctrl_bo = op.reconfig_method == "ctrlpkt"
+        # the ctrlpkt methods are the only ones whose entries carry a control-packet
+        # slot and that need the main:init overlay standup prepended.
+        self._needs_ctrl_bo = op.reconfig_method in ("ctrlpkt", "ctrlpkt_parallel")
 
         super().__init__(op)
 

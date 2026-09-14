@@ -58,6 +58,16 @@ def test_ctrlpkt_uses_reconfig_method():
     ]
 
 
+def test_ctrlpkt_parallel_adds_parallel_columns():
+    # The parallel ctrlpkt delivery: same overlay method, plus the (default-off)
+    # per-column shim-DMA collapse that runs columns in parallel.
+    assert _full_elf_reconfig_options("ctrlpkt_parallel") == [
+        "--reconfig-method=ctrlpkt",
+        "--ctrlpkt-parallel-columns",
+        "--get-scratchpad-parameters",
+    ]
+
+
 def test_an_unknown_method_is_rejected():
     with pytest.raises(ValueError):
         _full_elf_reconfig_options("bogus")

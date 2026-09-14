@@ -52,7 +52,7 @@ def main():
     parser.add_argument(
         "--reconfig-method",
         default=None,
-        choices=[None, "loadpdi", "loadpdi_union", "write32", "ctrlpkt"],
+        choices=[None, "loadpdi", "loadpdi_union", "write32", "ctrlpkt", "ctrlpkt_parallel"],
     )
     parser.add_argument("--out", required=True, help="output .npy for the logits")
     parser.add_argument("--token-id", type=int, default=42)

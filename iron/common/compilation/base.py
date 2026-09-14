@@ -629,7 +629,14 @@ class AieccCompilationRule(CompilationRule):
         super().__init__(*args, **kwargs)
 
 
-_RECONFIG_METHODS = (None, "loadpdi", "loadpdi_union", "write32", "ctrlpkt")
+_RECONFIG_METHODS = (
+    None,
+    "loadpdi",
+    "loadpdi_union",
+    "write32",
+    "ctrlpkt",
+    "ctrlpkt_parallel",
+)
 
 
 def _full_elf_reconfig_options(reconfig_method: str | None) -> list[str]:
@@ -650,6 +657,11 @@ def _full_elf_reconfig_options(reconfig_method: str | None) -> list[str]:
       runlist dispatch overhead against the static "loadpdi").
     - "write32"/"ctrlpkt": ``--reconfig-method=X --get-scratchpad-parameters``
       (union fold, runlist dispatch).
+    - "ctrlpkt_parallel": ``--reconfig-method=ctrlpkt --ctrlpkt-parallel-columns``
+      -- the ctrlpkt overlay, but each column's control packets collapse into one
+      shim DMA and columns run in parallel (default-off in aiecc). This is the
+      delivery meant to realise ctrlpkt's bandwidth advantage; plain "ctrlpkt" is
+      the serial baseline.
 
     ``--expand-load-pdis`` is dropped for every non-None mode; ``--get-full-elf``
     is already added by the full-elf build path.
@@ -663,6 +675,12 @@ def _full_elf_reconfig_options(reconfig_method: str | None) -> list[str]:
         return ["--expand-load-pdis", "--get-scratchpad-parameters"]
     if reconfig_method == "loadpdi":
         return ["--get-scratchpad-parameters"]
+    if reconfig_method == "ctrlpkt_parallel":
+        return [
+            "--reconfig-method=ctrlpkt",
+            "--ctrlpkt-parallel-columns",
+            "--get-scratchpad-parameters",
+        ]
     # Union/runlist forms select the delivery via --reconfig-method. "loadpdi_union"
     # folds the native load_pdi delivery into the union ELF, so its flag is
     # --reconfig-method=loadpdi (not =loadpdi_union).

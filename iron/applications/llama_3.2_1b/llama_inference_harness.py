@@ -193,7 +193,7 @@ def parse_args():
         "--reconfig-method",
         type=str,
         default=None,
-        choices=["loadpdi", "loadpdi_union", "write32", "ctrlpkt"],
+        choices=["loadpdi", "loadpdi_union", "write32", "ctrlpkt", "ctrlpkt_parallel"],
         help="Reconfiguration delivery for the fused decode ELF. Default (unset) "
         "keeps the shipped --expand-load-pdis build (A-expand). See "
         "OperatorSequence(reconfig_method=...).",
