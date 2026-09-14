@@ -173,6 +173,11 @@ class FusedDispatch(SequenceDispatch):
         return kernel_artifacts
 
     def make_callable(self, seq):
+        # loadpdi_union/write32/ctrlpkt build a union ELF (--reconfig-method) whose
+        # schedule is per-config entrypoints dispatched via pyxrt.runlist. None
+        # (expand) and "loadpdi" keep the single baked main:sequence entry.
+        if seq.reconfig_method in ("loadpdi_union", "write32", "ctrlpkt"):
+            return SequenceUnionRunlistCallable(seq)
         return SequenceFullELFCallable(seq)
 
 
@@ -297,9 +302,13 @@ class OperatorSequence(AIEOperatorBase):
         reconfig_method: Selects the aiecc reconfiguration flags used for the
             full-ELF build (``dispatch="fused"``/``"auto"`` on NPU2 only; ignored
             by other dispatch modes). ``None`` (default) keeps today's
-            ``--expand-load-pdis`` behaviour. ``"loadpdi"`` uses native
-            load_pdi (drops ``--expand-load-pdis``, no ``--reconfig-method``).
-            ``"write32"``/``"ctrlpkt"`` pass ``--reconfig-method=X``. See
+            ``--expand-load-pdis`` behaviour (static single dispatch). ``"loadpdi"``
+            uses native load_pdi (drops ``--expand-load-pdis``, no
+            ``--reconfig-method``; static single dispatch). ``"loadpdi_union"``,
+            ``"write32"`` and ``"ctrlpkt"`` build the ``--reconfig-method`` union
+            ELF, dispatched entry-by-entry via ``SequenceUnionRunlistCallable``
+            (``"loadpdi_union"`` folds native load_pdi into the union to isolate
+            runlist overhead against the static ``"loadpdi"``). See
             ``iron/common/compilation/base.py``'s
             ``_full_elf_reconfig_options`` for the exact option lists.
     """
@@ -596,41 +605,29 @@ class SequenceCallable:
         self._sync_outputs()
 
 
-class SequenceFullELFCallable(SequenceCallable):
-    """Single-ELF dispatch (NPU2): every operator shares three consolidated
-    input/output/scratch buffers addressed by offset. ``get_buffer`` returns a
-    sub-view into whichever consolidated buffer holds the named argument.
+class _ConsolidatedBufferCallable(SequenceCallable):
+    """Shared buffer model for the NPU dispatchers that consume
+    ``OperatorSequence``'s three consolidated input/output/scratch arenas
+    addressed by baked offset.
+
+    Both the single-ELF (``SequenceFullELFCallable``) and union-runlist
+    (``SequenceUnionRunlistCallable``) dispatchers pack every operator argument
+    into the same three ``XRTTensor`` arenas, so buffer allocation,
+    ``get_buffer`` sub-viewing, host<->device syncing and the parameter
+    scratchpad are identical. Subclasses supply only the kernel/dispatch setup
+    (``__init__``) and ``_run``; they must set ``self._params = None`` and
+    implement ``_make_scratchpad`` (the writer for this dispatcher's runtime
+    parameter scratchpad -- one run for the full-ELF, all entry runs for the
+    union).
     """
 
-    def __init__(self, op, device_name="main", sequence_name="sequence"):
-        _require_xrt()
-        self.device_name = device_name
-        self.sequence_name = sequence_name
-
-        assert isinstance(op.artifacts[0], comp.FullElfArtifact)
-        xrt_elf = pyxrt.elf(str(op.artifacts[0].filename))
-        xrt_context = pyxrt.hw_context(aie_utils.DefaultNPURuntime._device, xrt_elf)
-        self.xrt_kernel = pyxrt.ext.kernel(
-            xrt_context, f"{self.device_name}:{self.sequence_name}"
-        )
-
-        super().__init__(op)
-
-        # Persistent run handle: reused across dispatches so that the
-        # ctrl-scratchpad backing buffer (and any ParameterScratchpad state
-        # built on top of it) stays valid across calls.
-        self.run_handle = pyxrt.run(self.xrt_kernel)
-        self.run_handle.set_arg(0, self.input_buffer.buffer_object())
-        self.run_handle.set_arg(1, self.output_buffer.buffer_object())
-        self.run_handle.set_arg(2, self.scratch_buffer.buffer_object())
-        if self.trace_buffer is not None:
-            self.run_handle.set_arg(3, self.trace_buffer.buffer_object())
-
-        self._params = None
+    def _make_scratchpad(self, params_path):
+        """Build the runtime-parameter writer bound to this dispatcher's run(s)."""
+        raise NotImplementedError
 
     @property
     def params(self):
-        """Lazy ParameterScratchpad bound to this ELF's ctrl scratchpad BO.
+        """Lazy runtime-parameter writer bound to this ELF's ctrl scratchpad.
 
         The ``params.txt`` describing the runtime parameters is requested from
         aiecc via ``--get-scratchpad-parameters``; it is a graph output, so it
@@ -648,11 +645,7 @@ class SequenceFullELFCallable(SequenceCallable):
             return None
         if params_path.read_text().split("\n", 1)[0].strip() == "0":
             return None
-        from aie.utils.hostruntime.xrtruntime.parameter_scratchpad import (
-            ParameterScratchpad,
-        )
-
-        self._params = ParameterScratchpad(self.run_handle, str(params_path))
+        self._params = self._make_scratchpad(str(params_path))
         return self._params
 
     def _allocate_buffers(self):
@@ -707,11 +700,254 @@ class SequenceFullELFCallable(SequenceCallable):
             self.trace_buffer.device = "npu"
             self.trace_buffer.to("cpu")
 
+
+class SequenceFullELFCallable(_ConsolidatedBufferCallable):
+    """Single-ELF dispatch (NPU2): every operator shares three consolidated
+    input/output/scratch buffers addressed by offset. ``get_buffer`` returns a
+    sub-view into whichever consolidated buffer holds the named argument.
+
+    The whole schedule runs as ONE ``main:sequence`` dispatch (the 322 configs
+    are baked inline for ``--expand-load-pdis`` / native ``load_pdi``); the
+    union-runlist form is ``SequenceUnionRunlistCallable``.
+    """
+
+    def __init__(self, op, device_name="main", sequence_name="sequence"):
+        _require_xrt()
+        self.device_name = device_name
+        self.sequence_name = sequence_name
+
+        assert isinstance(op.artifacts[0], comp.FullElfArtifact)
+        xrt_elf = pyxrt.elf(str(op.artifacts[0].filename))
+        xrt_context = pyxrt.hw_context(aie_utils.DefaultNPURuntime._device, xrt_elf)
+        self.xrt_kernel = pyxrt.ext.kernel(
+            xrt_context, f"{self.device_name}:{self.sequence_name}"
+        )
+
+        super().__init__(op)
+
+        # Persistent run handle: reused across dispatches so that the
+        # ctrl-scratchpad backing buffer (and any ParameterScratchpad state
+        # built on top of it) stays valid across calls.
+        self.run_handle = pyxrt.run(self.xrt_kernel)
+        self.run_handle.set_arg(0, self.input_buffer.buffer_object())
+        self.run_handle.set_arg(1, self.output_buffer.buffer_object())
+        self.run_handle.set_arg(2, self.scratch_buffer.buffer_object())
+        if self.trace_buffer is not None:
+            self.run_handle.set_arg(3, self.trace_buffer.buffer_object())
+
+        self._params = None
+
+    def _make_scratchpad(self, params_path):
+        from aie.utils.hostruntime.xrtruntime.parameter_scratchpad import (
+            ParameterScratchpad,
+        )
+
+        return ParameterScratchpad(self.run_handle, params_path)
+
     def _run(self):
         self.run_handle.start()
         ret_code = self.run_handle.wait()
         if ret_code != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
             raise RuntimeError(f"Kernel execution failed with return code {ret_code}")
+
+
+# Bytes of the inert control-packet BO handed to every ctrlpkt entry (and to
+# main:init). The overlay bakes the reconfiguration, so the slot is never read;
+# it only has to exist and be large enough. Mirrors the reference harness's
+# dummy ctrl BO (test/python/npu-xrt/test_reconfig_runlist.py).
+_CTRL_BO_BYTES = 4096
+
+
+def _union_entry_names(runlist, designs, design_of, needs_ctrl_bo, device_name):
+    """Union ELF entrypoint names in schedule (configure) order.
+
+    Pure function (no device state) so it can be unit-tested off-device.
+
+    The fused-MLIR build (``fuse_mlir`` in ``compilation/sequence.py``) coalesces
+    *consecutive* runlist steps that use the same design into ONE
+    ``aiex.configure`` block -- it reconfigures only when the design changes. The
+    union split then makes one ELF entrypoint per configure block, named
+    ``<device>:op<design_idx>_<Class>_<block_idx>`` (design name exactly as in
+    ``FusedDispatch.build_fused_mlir`` -- keyed on the *design's* representative
+    class, not the step op's, so it stays correct if ``share_designs`` ever
+    collapses two classes onto one design; block index counts configure blocks
+    from 0). This mirrors the coalescing exactly, so the names match the ELF's
+    entrypoints one-for-one. ``needs_ctrl_bo`` (ctrlpkt) prepends ``<device>:init``.
+
+    Raises ``NotImplementedError`` for an odd configure-block count, which
+    ``fuse_mlir`` pads with an extra reset configure
+    (``needs_additional_reset``) that this dispatcher does not wire (llama's
+    schedule is even).
+    """
+    names = []
+    if needs_ctrl_bo:
+        names.append(f"{device_name}:init")
+    last_design_name = None
+    block_idx = 0
+    for step_op, *_bufs in runlist:
+        d = design_of[id(step_op)]
+        design_name = f"op{d}_{designs[d].__class__.__name__}"
+        if design_name == last_design_name:
+            # Consecutive same-design steps share one configure entry.
+            continue
+        last_design_name = design_name
+        names.append(f"{device_name}:{design_name}_{block_idx}")
+        block_idx += 1
+    if block_idx % 2 == 1:
+        raise NotImplementedError(
+            "union runlist dispatch: workload has an odd configure-point count "
+            "and needs an extra reset entry, which is not implemented"
+        )
+    return names
+
+
+class _BroadcastParameterScratchpad:
+    """Fan a runtime-parameter write/sync out to every union entry's ctrl
+    scratchpad.
+
+    The single-ELF dispatch has one ``pyxrt.run`` whose scratchpad BO every
+    config reads, so one ``ParameterScratchpad`` suffices. The union dispatches
+    each config as its OWN ``pyxrt.run``; a runtime parameter must land in the
+    scratchpad of whichever entry actually reads it (e.g. ``softmax_vector_size``
+    on the Softmax config), so we build one ``ParameterScratchpad`` per entry run
+    and broadcast writes/syncs to all. Writing a scratchpad an entry never reads
+    is harmless.
+
+    Cost/measurement caveat: this fans ``write``/``sync`` out to every entry per
+    token (a device sync each). It is intrinsic to the *harness*, not the
+    dispatch method being measured, so it can add a small per-token overhead to
+    the union's reported timings that a consumer-targeted implementation would
+    not pay. Every union entry was found to expose a ctrl scratchpad BO
+    (322/322 for the llama write32 build), so a per-run construction failure is a
+    genuine error and propagates rather than being silently skipped.
+    """
+
+    def __init__(self, runs, params_path):
+        from aie.utils.hostruntime.xrtruntime.parameter_scratchpad import (
+            ParameterScratchpad,
+        )
+
+        self._pads = [ParameterScratchpad(run, params_path) for run in runs]
+        if not self._pads:
+            raise RuntimeError("union has no entry runs to bind parameters to")
+
+    def write(self, name, value):
+        for pad in self._pads:
+            pad.write(name, value)
+
+    def sync(self):
+        for pad in self._pads:
+            pad.sync()
+
+    def read(self, name):
+        return self._pads[0].read(name)
+
+
+class SequenceUnionRunlistCallable(_ConsolidatedBufferCallable):
+    """Union-ELF dispatch (NPU2): the ``--reconfig-method`` fold packages the
+    schedule as one ELF with one entrypoint per configure block
+    (``main:op<design_idx>_<Class>_<block_idx>``); each entry reconfigures the
+    array and runs the config's step(s) -- consecutive same-design runlist steps
+    coalesce into one block (llama: 882 steps -> 322 entries). A single
+    ``pyxrt.runlist`` submits every entry in schedule order, atomically and in
+    place; each binds the SAME three consolidated base BOs (each entry bakes its
+    own sub-view offsets into those arenas, so there is no per-step BO math).
+
+    ``ctrlpkt`` additionally stands up a resident overlay via a prepended
+    ``main:init`` and gives every entry an extra inert control-packet BO; the
+    ``write32``/``loadpdi_union`` forms need neither. Correctness across the
+    separate per-entry dispatches relies on (a) the shared scratch arena (op K's
+    writes persist for op K+1) and (b) the runlist executing in order. Runtime
+    parameters are broadcast to every entry's scratchpad (see
+    ``_BroadcastParameterScratchpad``), since the scratchpad is per-entry-run.
+    """
+
+    def __init__(self, op, device_name="main"):
+        _require_xrt()
+        self.device_name = device_name
+
+        if op.trace_size:
+            # Trace lowering appends a 4th buffer, but the union binds only the 3
+            # base BOs per entry (arg slot 3 is the ctrl BO for ctrlpkt), so the
+            # trace buffer would never be wired. Fail loud rather than silently.
+            raise NotImplementedError(
+                "hardware tracing is not supported for union runlist dispatch"
+            )
+
+        assert isinstance(op.artifacts[0], comp.FullElfArtifact)
+        self._xrt_elf = pyxrt.elf(str(op.artifacts[0].filename))
+        self._xrt_context = pyxrt.hw_context(
+            aie_utils.DefaultNPURuntime._device, self._xrt_elf
+        )
+        # ctrlpkt is the only method whose entries carry a control-packet slot
+        # and that needs the main:init overlay standup prepended.
+        self._needs_ctrl_bo = op.reconfig_method == "ctrlpkt"
+
+        super().__init__(op)
+
+        # One inert control-packet BO, shared by main:init and every entry.
+        self._ctrl_buffer = None
+        if self._needs_ctrl_bo:
+            self._ctrl_buffer = XRTTensor(
+                (_n_elements(_CTRL_BO_BYTES),), dtype=ml_dtypes.bfloat16
+            )
+            self._ctrl_buffer.to("npu")
+
+        base_bos = (
+            self.input_buffer.buffer_object(),
+            self.output_buffer.buffer_object(),
+            self.scratch_buffer.buffer_object(),
+        )
+
+        # Build the runlist ONCE and reuse it across decode tokens: rebuilding
+        # 322 pyxrt.run + set_arg per token would reintroduce exactly the
+        # per-token host overhead this dispatch mode is meant to measure. The
+        # kernels and runs are retained (self._keep) for the callable's life so
+        # the runlist's references stay valid.
+        self._runlist = pyxrt.runlist(self._xrt_context)
+        self._keep = []  # kernels + runs kept alive for the runlist's life
+        self._entry_runs = []  # per-config entry runs (excludes main:init)
+        for name in self._entry_names():
+            kernel = pyxrt.ext.kernel(self._xrt_context, name)
+            run = pyxrt.run(kernel)
+            if name.endswith(":init"):
+                # main:init has a fixed overlay-defined signature: only the
+                # (inert) control-packet BO, no data arenas.
+                run.set_arg(0, self._ctrl_buffer.buffer_object())
+            else:
+                for i, bo in enumerate(base_bos):
+                    run.set_arg(i, bo)
+                if self._needs_ctrl_bo:
+                    run.set_arg(len(base_bos), self._ctrl_buffer.buffer_object())
+                self._entry_runs.append(run)
+            self._runlist.add(run)
+            self._keep.append((kernel, run))
+
+        self._params = None
+
+    def _entry_names(self):
+        """This ELF's entrypoint names in schedule (configure) order.
+
+        Delegates to :func:`_union_entry_names`; ``ctrlpkt`` prepends
+        ``main:init``.
+        """
+        designs, design_of = self.op.unique_designs()
+        return _union_entry_names(
+            self.op.runlist,
+            designs,
+            design_of,
+            self._needs_ctrl_bo,
+            self.device_name,
+        )
+
+    def _make_scratchpad(self, params_path):
+        # The union has one ctrl scratchpad per entry run, so a parameter must
+        # reach whichever entry reads it; broadcast to all entry runs.
+        return _BroadcastParameterScratchpad(self._entry_runs, params_path)
+
+    def _run(self):
+        self._runlist.execute()
+        self._runlist.wait()
 
 
 class _PerBufferCallable(SequenceCallable):

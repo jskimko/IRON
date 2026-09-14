@@ -35,6 +35,15 @@ def test_loadpdi_drops_expand_and_adds_no_reconfig_method():
     assert _full_elf_reconfig_options("loadpdi") == ["--get-scratchpad-parameters"]
 
 
+def test_loadpdi_union_maps_to_reconfig_method_loadpdi():
+    # Union fold of native load_pdi: --reconfig-method=loadpdi (NOT =loadpdi_union),
+    # so the loadpdi delivery gets the union/runlist packaging.
+    assert _full_elf_reconfig_options("loadpdi_union") == [
+        "--reconfig-method=loadpdi",
+        "--get-scratchpad-parameters",
+    ]
+
+
 def test_write32_uses_reconfig_method():
     assert _full_elf_reconfig_options("write32") == [
         "--reconfig-method=write32",

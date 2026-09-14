@@ -629,20 +629,30 @@ class AieccCompilationRule(CompilationRule):
         super().__init__(*args, **kwargs)
 
 
-_RECONFIG_METHODS = (None, "loadpdi", "write32", "ctrlpkt")
+_RECONFIG_METHODS = (None, "loadpdi", "loadpdi_union", "write32", "ctrlpkt")
 
 
 def _full_elf_reconfig_options(reconfig_method: str | None) -> list[str]:
     """The aiecc reconfiguration flags for a FullElfArtifact's ``reconfig_method``.
 
+    Two axes: reconfiguration *delivery* (expand / native load_pdi / write32 /
+    ctrlpkt) and *packaging* (static single ``main:sequence`` dispatch vs the
+    ``--reconfig-method`` union fold dispatched entry-by-entry via a runlist).
+
     - None (default): ``--expand-load-pdis --get-scratchpad-parameters``
-      (A-expand, byte-identical to the pre-``reconfig_method`` behaviour).
+      (A-expand, static; byte-identical to the pre-``reconfig_method`` behaviour).
     - "loadpdi": drop ``--expand-load-pdis``; keep
       ``--get-scratchpad-parameters``; no ``--reconfig-method`` (A-loadpdi,
-      native load_pdi).
+      native load_pdi, static single dispatch).
+    - "loadpdi_union": ``--reconfig-method=loadpdi`` (native load_pdi delivery,
+      folded into the union ELF for runlist dispatch -- the loadpdi content of
+      "loadpdi" with the union packaging of write32/ctrlpkt, isolating the
+      runlist dispatch overhead against the static "loadpdi").
     - "write32"/"ctrlpkt": ``--reconfig-method=X --get-scratchpad-parameters``
-      (``--expand-load-pdis`` dropped; ``--get-full-elf`` is already added by
-      the full-elf build path).
+      (union fold, runlist dispatch).
+
+    ``--expand-load-pdis`` is dropped for every non-None mode; ``--get-full-elf``
+    is already added by the full-elf build path.
     """
     if reconfig_method not in _RECONFIG_METHODS:
         raise ValueError(
@@ -653,7 +663,11 @@ def _full_elf_reconfig_options(reconfig_method: str | None) -> list[str]:
         return ["--expand-load-pdis", "--get-scratchpad-parameters"]
     if reconfig_method == "loadpdi":
         return ["--get-scratchpad-parameters"]
-    return [f"--reconfig-method={reconfig_method}", "--get-scratchpad-parameters"]
+    # Union/runlist forms select the delivery via --reconfig-method. "loadpdi_union"
+    # folds the native load_pdi delivery into the union ELF, so its flag is
+    # --reconfig-method=loadpdi (not =loadpdi_union).
+    delivery = "loadpdi" if reconfig_method == "loadpdi_union" else reconfig_method
+    return [f"--reconfig-method={delivery}", "--get-scratchpad-parameters"]
 
 
 class AieccFullElfCompilationRule(AieccCompilationRule):
