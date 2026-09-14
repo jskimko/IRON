@@ -98,3 +98,31 @@ class StridedCopy(MLIROperator):
             AIERuntimeArgSpec("in", (int(self.input_buffer_size),), dtype=self.dtype),
             AIERuntimeArgSpec("out", (int(self.output_buffer_size),), dtype=self.dtype),
         ]
+
+    def reference(self, input_flat):
+        """CPU reference: the same gather/scatter data movement the op performs.
+
+        StridedCopy is pure data movement, so the reference is the module-level
+        gather-by-input-tap / scatter-by-output-tap over the access patterns. The
+        runtime offset parameters (``input_offset_parameter`` /
+        ``output_offset_parameter``, e.g. ``cache_offset``) default to their reset
+        value 0 here, which is correct whenever the parameter is 0 (e.g. the
+        ``num_preceding_tokens == 0`` decode step). For a non-zero runtime offset,
+        call ``strided_copy.reference.reference`` with the matching
+        ``*_offset_addend`` directly.
+        """
+        import torch
+
+        from .reference import reference as _strided_copy_reference
+
+        return _strided_copy_reference(
+            torch.as_tensor(input_flat).reshape(-1),
+            self.input_sizes,
+            self.input_strides,
+            self.input_offset,
+            self.output_buffer_size,
+            self.output_sizes,
+            self.output_strides,
+            self.output_offset,
+            num_aie_channels=self.num_aie_channels,
+        )

@@ -7,8 +7,14 @@ from ml_dtypes import bfloat16
 
 
 def reference(A, B):
-    """CPU reference: matrix-vector product ``C = A @ B`` (ground truth)."""
-    return A @ B
+    """CPU reference: (optionally batched) matrix-vector product (ground truth).
+
+    ``A`` is ``(M, K)`` with vector ``B`` ``(K,)`` -> ``(M,)``, or batched
+    ``(batch, M, K)`` with ``B`` ``(batch, K)`` -> ``(batch, M)`` (num_batches
+    independent mat-vecs, as the batched GEMV op lays them out). A plain
+    ``A @ B`` does NOT do a per-batch mat-vec for the 3D case, so give the vector
+    an explicit trailing dim and matmul, which is correct for both ranks."""
+    return torch.matmul(A, B.unsqueeze(-1)).squeeze(-1)
 
 
 def generate_golden_reference(
