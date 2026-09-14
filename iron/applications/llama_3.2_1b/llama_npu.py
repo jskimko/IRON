@@ -60,9 +60,15 @@ class AIEDecodeOperations:
 
 class AIELlamaOperators:
 
-    def __init__(self, config, prompt_len):
+    def __init__(self, config, prompt_len, reconfig_method=None):
         self.context = AIEContext()
         self.context.build_dir.mkdir(parents=True, exist_ok=True)
+        # Reconfiguration delivery method for the fused decode ELF build; see
+        # OperatorSequence(reconfig_method=...). None keeps the shipped
+        # --expand-load-pdis behaviour (A-expand). Non-None methods build into a
+        # per-method dir so their distinct ELF never collides with the cached
+        # build_elf/fused_op.elf (the mtime cache would otherwise reuse it).
+        self.reconfig_method = reconfig_method
 
         self.prefill = AIEPrefillOperations()
         self.decode = AIEDecodeOperations()
@@ -274,7 +280,13 @@ class AIELlamaOperators:
         # Decode operator (everything temporally fused)
         # ##################################################################
 
-        elf_ctx = AIEContext(build_dir="build_elf")
+        elf_ctx = AIEContext(
+            build_dir=(
+                "build_elf"
+                if reconfig_method is None
+                else f"build_elf/{reconfig_method}"
+            )
+        )
 
         gemv_attn_query_op = GEMV(
             M=config.n_heads * config.head_dim,
@@ -562,6 +574,7 @@ class AIELlamaOperators:
                 "rope_angles",
             ],
             output_args=["logits"],
+            reconfig_method=reconfig_method,
             buffer_sizes={
                 **{
                     f"keys_cache_{layer_idx}": cache_buffer_size
@@ -1233,7 +1246,9 @@ def main():
 
     config, state = harness.init(args.weights_path, args.tokenizer_path, prompt=prompt)
 
-    aie_ops = AIELlamaOperators(config, max_seq_len)
+    aie_ops = AIELlamaOperators(
+        config, max_seq_len, reconfig_method=args.reconfig_method
+    )
     aie_buffers = AIELlamaBuffers(config, max_seq_len, aie_ops)
 
     print(prompt, end="", flush=True)
