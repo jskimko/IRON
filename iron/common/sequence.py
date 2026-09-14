@@ -911,8 +911,11 @@ class SequenceUnionRunlistCallable(_ConsolidatedBufferCallable):
             kernel = pyxrt.ext.kernel(self._xrt_context, name)
             run = pyxrt.run(kernel)
             if name.endswith(":init"):
-                # main:init has a fixed overlay-defined signature: only the
-                # (inert) control-packet BO, no data arenas.
+                # main:init stands up the ctrlpkt overlay. It must run at the head
+                # of EVERY dispatch pass, not once: the per-config self-clear
+                # teardown consumes the overlay over the pass, so hoisting init to
+                # a one-time standup makes the second token's runlist time out
+                # (verified). Fixed signature: only the (inert) control-packet BO.
                 run.set_arg(0, self._ctrl_buffer.buffer_object())
             else:
                 for i, bo in enumerate(base_bos):
