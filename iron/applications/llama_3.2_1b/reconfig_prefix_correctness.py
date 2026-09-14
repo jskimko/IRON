@@ -99,8 +99,17 @@ def main():
     cb.input_buffer.to("npu")
     if cb.params is not None:  # only when the prefix consumes runtime params
         # A prefix declares only the params its ops consume, so write each one
-        # only if present (fixed decode step: cache_offset=0, vector_size=1).
-        for pname, pval in (("cache_offset", 0), ("softmax_vector_size", 1)):
+        # only if present. cache_offset=0 (num_preceding=0). softmax_vector_size is
+        # set to the FULL row width (cols) so the NPU softmaxes over the whole row,
+        # matching Softmax.reference (which ignores the runtime param and always
+        # uses cols) -- both then softmax the same inputs. This tests the softmax
+        # compute over the full row; the masked runtime-vector_size path is a
+        # separate concern (Softmax.reference does not yet honor it).
+        softmax_cols = next(
+            (op.cols for op, *_ in fo.runlist if op.__class__.__name__ == "Softmax"),
+            1,
+        )
+        for pname, pval in (("cache_offset", 0), ("softmax_vector_size", softmax_cols)):
             try:
                 cb.params.write(pname, np.int32(pval))
             except RuntimeError:

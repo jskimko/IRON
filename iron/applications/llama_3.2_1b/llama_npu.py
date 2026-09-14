@@ -598,9 +598,12 @@ class AIELlamaOperators:
         if decode_prefix_n is not None:
             runlist = runlist[:decode_prefix_n]
             prefix_bufs = {b for _op, *bufs in runlist for b in bufs}
+            # Buffer names may carry slice notation "name[a:b]"; explicit
+            # buffer_sizes are keyed by the base name, so match on that.
+            prefix_bases = {b.split("[", 1)[0] for b in prefix_bufs}
             input_args = [a for a in input_args if a in prefix_bufs]
             output_args = [runlist[-1][-1]]  # last kept op's output buffer
-            buffer_sizes = {k: v for k, v in buffer_sizes.items() if k in prefix_bufs}
+            buffer_sizes = {k: v for k, v in buffer_sizes.items() if k in prefix_bases}
         self.decode.prefix_runlist = runlist
 
         self.decode.fused_op = OperatorSequence(
