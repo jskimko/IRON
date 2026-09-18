@@ -14,7 +14,18 @@ from pathlib import Path
 from aie import ir
 from aie.dialects import aie, aiex, memref
 from aie.extras.context import mlir_mod_ctx
-from aie.utils.trace import get_trace_slices
+
+try:
+    from aie.utils.trace import get_trace_slices
+except ImportError:
+    # Older mlir-aie (e.g. the control-packet reconfiguration toolchain branch)
+    # predates get_trace_slices. Only trace_buffer_size() uses it, and untraced
+    # builds -- every reconfiguration baseline -- have no fused trace slices, so
+    # an empty list (buffer size 0) is the correct result.
+    def get_trace_slices(mlir_text):
+        return []
+
+
 import ml_dtypes
 
 from typing import Any
