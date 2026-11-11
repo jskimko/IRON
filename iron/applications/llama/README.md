@@ -81,6 +81,11 @@ top-k must be at most 64.
   text is the same, token for token)
 - `--no-full-elf`: dispatch every step of each version on its own from one
   xclbin, the form NPU1 runs (below); `--full-elf` asks for one full ELF
+- `--control-packets`: configure each full ELF's designs with control
+  packets rather than register writes (aiecc's `--load-pdi-to-ctrl-pkt`);
+  `--ctrlpkt-multicast-span W`, `--no-ctrlpkt-parallel-shims` and
+  `--no-ctrlpkt-adaptive-overlay` set aiecc's options of those names. The
+  model tests take the same flags
 - `-v`: log iron's INFO lines, such as each compile's
 
 ## NPU1, and `--no-full-elf`

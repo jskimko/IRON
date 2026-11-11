@@ -8,7 +8,6 @@ Each over a model ``Model.load`` loaded, its figures through the test's
 """
 
 import dataclasses
-import functools
 import hashlib
 import os
 import time
@@ -24,6 +23,7 @@ from iron.common.graph.compiled import walk
 
 from .blocks import KVCache
 from .causal import Checkpoints
+from .cli import control_packets
 from .generation import (
     SEED,
     Sampler,
@@ -112,8 +112,8 @@ def load_from_flags(
 ):
     """``model.load`` of ``weights``' directory, to call with any further options.
 
-    As the CLI loads it at pytest's ``--random-weights`` and
-    ``--max-seq-len``; ``require``s the files it needs.
+    As the CLI loads it at pytest's ``--random-weights``, ``--max-seq-len``
+    and control packet options; ``require``s the files it needs.
     """
     seed = request.config.getoption("--random-weights")
     files = [weights, weights.with_name("config.json")]
@@ -121,9 +121,20 @@ def load_from_flags(
         files.append(weights.with_name(tokenizer))
     require(*files, staged=staged)
     max_seq_len = request.config.getoption("--max-seq-len")
-    return functools.partial(
-        model.load, weights.parent, random_weights=seed, max_seq_len=max_seq_len
-    )
+    packets = control_packets(request.config.getoption)
+
+    def load(*, full_elf=None, **options):
+        # Control packets configure a full ELF: an xclbin a test asks for goes without.
+        return model.load(
+            weights.parent,
+            random_weights=seed,
+            max_seq_len=max_seq_len,
+            full_elf=full_elf,
+            control_packets=None if full_elf is False else packets,
+            **options,
+        )
+
+    return load
 
 
 def prompt(model, chars: int, num_tokens: int, skip: int = 0) -> list[int]:

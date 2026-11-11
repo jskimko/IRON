@@ -41,7 +41,7 @@ from ..image.callable import (
     ScratchArena,
 )
 from ..image.link import FullELF, PerStep
-from ..image.packaging import Kind, Plan, plan, require_device
+from ..image.packaging import ControlPackets, Kind, Plan, plan, require_device
 from ..image.sequence import Image
 from ..image.step import BufferRef
 from .carried import CARRY, EmitSite, attach_emit, compose
@@ -543,6 +543,7 @@ class Graph:
         full_elf: bool | None = None,
         check: bool = False,
         feeds: CompiledGraph | None = None,
+        control_packets: ControlPackets | None = None,
         **shapes: Sequence[int] | tuple[Sequence[int], DTypeLike],
     ) -> CompiledGraph:
         """Compile and return the version for these input shapes.
@@ -555,6 +556,8 @@ class Graph:
             full_elf: One full ELF, else an xclbin per step; ``None`` derives it.
             check: Run each step on its own dispatch, raising at the first
                 outside its ``tolerance()``.
+            control_packets: Configure a full ELF's designs by control
+                packets, not register writes.
             feeds: The version a full ELF's Emit starts; by default itself
                 when it takes no tensor.
             **shapes: Each input's shape, or ``(shape, dtype)``.
@@ -571,6 +574,7 @@ class Graph:
                 full_elf,
                 check,
                 step_words=_step_words(recording),
+                control_packets=control_packets,
             )
             logger.info("%s", chosen.report(self.name))
             signature = self._signature(
@@ -765,7 +769,11 @@ class CompiledGraph:
             recording, share=plan.full_elf, extents=not plan.full_elf
         )
         packaging = (
-            FullELF(commands=plan.commands, shared_words=self.shared)
+            FullELF(
+                commands=plan.commands,
+                shared_words=self.shared,
+                control_packets=plan.control_packets,
+            )
             if plan.full_elf
             else PerStep(check)
         )

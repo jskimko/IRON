@@ -219,6 +219,8 @@ class Composition:
         # the PDI it has loaded, unless the build is traced or asks to
         # reconfigure.
         self.expands = len(self.designs) > 1 or seq.traced or full_elf.reconfigure
+        # Control packets configure where it does, in place of register writes.
+        self.control_packets = full_elf.control_packets if self.expands else None
         self.layout = seq.layout
         self.buffer_sizes = seq.buffer_sizes
         self.commands = full_elf.commands
@@ -243,6 +245,7 @@ class Composition:
             # Absent when unsplit, so every one-command image keeps its key.
             *([self.commands] if self.commands else []),
             *(["expands"] if self.expands else []),
+            *([self.control_packets] if self.control_packets else []),
         )
         h.update(repr(state).encode())
         return h.hexdigest()[:24]
@@ -351,7 +354,8 @@ class Composition:
         module = Program.compose(
             [*configurations.values(), main],
             entry=entries[0],
-            expand_load_pdis=self.expands or None,
+            # --load-pdi-to-ctrl-pkt (FullELF.link) replaces --expand-load-pdis.
+            expand_load_pdis=(self.expands and not self.control_packets) or None,
         ).resolve_program()
         return str(module)
 

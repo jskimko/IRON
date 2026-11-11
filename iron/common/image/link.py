@@ -23,7 +23,7 @@ from ..design import OperatorDesign
 from .artifacts import Design
 from .callable import FullELFCallable, PerStepCallable
 from .compose import Composition
-from .packaging import require_device
+from .packaging import ControlPackets, require_device
 
 
 class FullELF:
@@ -33,6 +33,8 @@ class FullELF:
         reconfigure: Configure the array at every call, even for one design.
         commands: The steps that each start a command after the first.
         shared_words: Design symbol -> the scratchpad word it shares.
+        control_packets: Configure the designs by control packets, where the
+            array is configured at every call (``Composition.expands``).
     """
 
     # --get-scratchpad-parameters emits the parameter table the host writes
@@ -47,10 +49,12 @@ class FullELF:
         reconfigure: bool = False,
         commands: Sequence[int] = (),
         shared_words: Mapping[str, str] | None = None,
+        control_packets: ControlPackets | None = None,
     ):
         self.reconfigure = reconfigure
         self.commands = tuple(commands)
         self.shared_words = dict(shared_words or {})
+        self.control_packets = control_packets
         self.composition: Composition | None = None
         self.design: CompilableDesign | None = None
 
@@ -72,9 +76,11 @@ class FullELF:
                     f"{dev.name} ({dev.arch}) does not dispatch a full ELF"
                 )
             composition = self.composition = Composition(seq)
+            control_packets = composition.control_packets
             flags = [
                 *self.FLAGS,
                 *([self.TRACE_FLAG] if seq.traced else []),
+                *(control_packets.aiecc_flags if control_packets else []),
             ]
 
             # The cache follows the modules a generator reaches, not the state

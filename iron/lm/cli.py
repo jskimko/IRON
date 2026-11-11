@@ -7,9 +7,12 @@ import argparse
 import importlib
 import inspect
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
+
+from iron.common.image.packaging import ControlPackets
 
 from .generation import Sampler, accuracy, determinism, generate_on_host, kl_stats
 from .model import Model, prompt_text
@@ -37,7 +40,59 @@ FLAGS: tuple[tuple[tuple[str, ...], dict[str, Any]], ...] = (
             "together (default: the checkpoint's max_position_embeddings)",
         ),
     ),
+    (
+        ("--control-packets",),
+        dict(
+            action="store_true",
+            help="configure each full ELF's designs by control packets "
+            "(aiecc's --load-pdi-to-ctrl-pkt), not register writes",
+        ),
+    ),
+    (
+        ("--ctrlpkt-multicast-span",),
+        dict(
+            type=int,
+            default=None,
+            metavar="W",
+            help="with --control-packets: aiecc's --ctrlpkt-multicast-span, "
+            "the columns a control multicast covers (default: aiecc's, 1; 0 off)",
+        ),
+    ),
+    (
+        ("--no-ctrlpkt-parallel-shims",),
+        dict(
+            action="store_true",
+            help="with --control-packets: aiecc's --ctrlpkt-parallel-shims=false",
+        ),
+    ),
+    (
+        ("--no-ctrlpkt-adaptive-overlay",),
+        dict(
+            action="store_true",
+            help="with --control-packets: aiecc's --ctrlpkt-adaptive-overlay=false",
+        ),
+    ),
 )
+
+
+def control_packets(option: Callable[[str], Any]) -> ControlPackets | None:
+    """Return the ``ControlPackets`` ``FLAGS`` ask for, each read by ``option(dest)``.
+
+    Raises:
+        ValueError: A delivery option without ``--control-packets``.
+    """
+    span = option("ctrlpkt_multicast_span")
+    serial = option("no_ctrlpkt_parallel_shims")
+    fixed = option("no_ctrlpkt_adaptive_overlay")
+    if not option("control_packets"):
+        if span is not None or serial or fixed:
+            raise ValueError(
+                "--ctrlpkt-multicast-span, --no-ctrlpkt-parallel-shims and "
+                "--no-ctrlpkt-adaptive-overlay take --control-packets"
+            )
+        return None
+    span = {} if span is None else {"multicast_span": span}
+    return ControlPackets(adaptive_overlay=not fixed, parallel_shims=not serial, **span)
 
 
 def exports(package: str, names):
@@ -135,6 +190,7 @@ def main(model_class: type[Model]):
     if args.check_determinism is not None and args.check_determinism < 2:
         parser.error("--check-determinism compares rounds: give 2 or more")
     try:
+        packets = control_packets(lambda dest: getattr(args, dest))
         model = model_class.from_checkpoint(
             args.path, random_weights=args.random_weights, max_seq_len=args.max_seq_len
         )
@@ -152,7 +208,11 @@ def main(model_class: type[Model]):
             f"{model.config.max_seq_len} rows"
         )
     assert model.checkpoint is not None, "from_checkpoint gives it one"
-    model.load_versions(release=model.checkpoint.release, full_elf=args.full_elf)
+    model.load_versions(
+        release=model.checkpoint.release,
+        full_elf=args.full_elf,
+        control_packets=packets,
+    )
 
     if args.check_accuracy:
         results = accuracy(model, model.cpu_reference(), tokens, args.num_tokens)

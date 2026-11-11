@@ -19,6 +19,7 @@ from iron.common.design import OperatorDesign
 from iron.common.graph.record import Recording
 from iron.common.image.compose import Composition
 from iron.common.image.link import FullELF
+from iron.common.image.packaging import ControlPackets
 from iron.common.image.sequence import Image
 from iron.common.image.step import BufferRef, SequenceStep
 from iron.operators import ReLU
@@ -32,7 +33,7 @@ def _bind_npu2():
 pytestmark = pytest.mark.usefixtures("npu2")  # a bound device, restored
 
 
-def _sequence(shapes):
+def _sequence(shapes, packaging=None):
     """One GEMV per ``(M, K)``, each on its own buffers."""
     steps = [
         SequenceStep(GEMV(M=m, K=k), tuple(map(BufferRef, (f"w{i}", f"x{i}", f"y{i}"))))
@@ -45,14 +46,14 @@ def _sequence(shapes):
             [f"{b}{i}" for i in range(len(shapes)) for b in "wx"],
             [f"y{i}" for i in range(len(shapes))],
         ),
-        FullELF(),
+        packaging or FullELF(),
     )
     seq._prepare()
     return seq
 
 
-def _identity(shapes):
-    return Composition(_sequence(shapes)).identity
+def _identity(shapes, packaging=None):
+    return Composition(_sequence(shapes, packaging)).identity
 
 
 SHAPES = [(512, 1024), (256, 1024), (512, 2048)]
@@ -100,6 +101,25 @@ def test_identity_is_what_the_text_is_a_function_of():
     assert _identity(SHAPES) == _identity(SHAPES)
     assert _identity(SHAPES) != _identity([(512, 1024), (256, 1024), (512, 4096)])
     assert _identity(SHAPES) != _identity(SHAPES[::-1])
+
+
+def test_control_packets_replace_expanded_loads():
+    """Several designs: aiecc's --load-pdi-to-ctrl-pkt, not --expand-load-pdis.
+
+    One design keeps the firmware's load, so its image is the plain one.
+    """
+    packets = ControlPackets()
+    plain = Composition(_sequence(SHAPES))
+    sent = Composition(_sequence(SHAPES, FullELF(control_packets=packets)))
+    assert "iron.expand_load_pdis = true" in plain.text()
+    assert "iron.expand_load_pdis" not in sent.text()
+    assert sent.control_packets == packets
+    assert sent.identity != plain.identity
+    spanned = FullELF(control_packets=ControlPackets(multicast_span=4))
+    assert _identity(SHAPES, spanned) != sent.identity
+    one = Composition(_sequence(SHAPES[:1], FullELF(control_packets=packets)))
+    assert one.control_packets is None
+    assert one.identity == _identity(SHAPES[:1])
 
 
 def test_two_designs_whose_device_names_collide_are_refused():

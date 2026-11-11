@@ -12,7 +12,8 @@ import iron
 from iron import Carried, Scratchpad
 from iron.common.graph.compiled import _step_words
 from iron.common.graph.record import Recording
-from iron.common.image.packaging import SCRATCHPAD_WORDS, Kind, plan
+from iron.common.image.packaging import SCRATCHPAD_WORDS, ControlPackets, Kind, plan
+from iron.lm.cli import control_packets
 from iron.operators.mha import MHA
 from iron.operators.relu import ReLU
 from iron.tests.support.llama_model import small
@@ -83,6 +84,62 @@ def test_a_shipped_image_in_a_graph_is_refused(npu2):
     for full_elf in (None, False):
         with pytest.raises(ValueError, match=r"Shipped \(flm_mm_.*outside a graph"):
             plan(npu2, recording, full_elf=full_elf)
+
+
+def test_control_packets_take_a_full_elf():
+    packets = ControlPackets()
+    p = plan(NPU2(), _recorded(), control_packets=packets)
+    assert p.full_elf and p.control_packets == packets
+    assert p.reasons[-1] == f"designs configured by control packets: {packets}"
+    with pytest.raises(ValueError, match="control packets configure a full ELF"):
+        plan(NPU2(), _recorded(), full_elf=False, control_packets=packets)
+    with pytest.raises(ValueError, match=r"npu1 \(AIE2\) has no full-ELF dispatch"):
+        plan(NPU1(), _recorded(), control_packets=packets)
+    assert plan(NPU2(), _recorded()).control_packets is None
+
+
+def test_control_packets_are_aieccs_options():
+    # aiecc's defaults go unsaid, so a toolchain without the options builds them.
+    assert ControlPackets().aiecc_flags == ("--load-pdi-to-ctrl-pkt",)
+    assert ControlPackets(parallel_shims=False, multicast_span=0).aiecc_flags[1:] == (
+        "--ctrlpkt-parallel-shims=false",
+        "--ctrlpkt-multicast-span=0",
+    )
+    assert ControlPackets(multicast_span=8).aiecc_flags[1:] == (
+        "--ctrlpkt-multicast-span=8",
+    )
+    assert ControlPackets(adaptive_overlay=False).aiecc_flags[1:] == (
+        "--ctrlpkt-adaptive-overlay=false",
+    )
+    with pytest.raises(ValueError, match="multicast_span is a column count"):
+        ControlPackets(multicast_span=-1)
+
+
+def test_control_packet_flags_read_as_the_cli_gives_them():
+    def options(**given):
+        flags = dict(
+            control_packets=False,
+            ctrlpkt_multicast_span=None,
+            no_ctrlpkt_parallel_shims=False,
+            no_ctrlpkt_adaptive_overlay=False,
+        )
+        return control_packets({**flags, **given}.__getitem__)
+
+    assert options() is None
+    assert options(control_packets=True) == ControlPackets()
+    assert options(
+        control_packets=True,
+        ctrlpkt_multicast_span=8,
+        no_ctrlpkt_parallel_shims=True,
+        no_ctrlpkt_adaptive_overlay=True,
+    ) == ControlPackets(adaptive_overlay=False, parallel_shims=False, multicast_span=8)
+    for given in (
+        {"ctrlpkt_multicast_span": 2},
+        {"no_ctrlpkt_parallel_shims": True},
+        {"no_ctrlpkt_adaptive_overlay": True},
+    ):
+        with pytest.raises(ValueError, match="take --control-packets"):
+            options(**given)
 
 
 def test_report_reads_as_one_block():

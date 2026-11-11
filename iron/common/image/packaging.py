@@ -6,6 +6,8 @@
 ``full_elf=None`` picks a full ELF unless NPU1 or ``check`` forces an xclbin per
 step. A full ELF is one command unless a host step runs between steps or the
 words a command reads would pass ``SCRATCHPAD_WORDS`` (``Plan.commands``).
+A full ELF configures its designs with register writes, or with
+``ControlPackets``.
 """
 
 from __future__ import annotations
@@ -27,6 +29,48 @@ class Kind(enum.Enum):
     CARRIED = "iron.carried"
 
 
+@dataclasses.dataclass(frozen=True)
+class ControlPackets:
+    """A full ELF's designs configured by control packets (aiecc's ``--load-pdi-to-ctrl-pkt``).
+
+    Each configuration is torn down before the next; each command starts
+    with one reset and the control overlay's load. Each field is the aiecc
+    option of its name, at aiecc's default, and passed only where it is
+    not, so a toolchain without the delivery options builds the default.
+
+    Args:
+        adaptive_overlay: ``--ctrlpkt-adaptive-overlay``: route the control
+            overlay around the designs' own resources; else on channel 0's
+            default routes.
+        parallel_shims: ``--ctrlpkt-parallel-shims``: start every column's
+            transfers before awaiting any.
+        multicast_span: ``--ctrlpkt-multicast-span``: send the packets the
+            core tiles of each group of this many columns share once; 0 off.
+    """
+
+    adaptive_overlay: bool = True
+    parallel_shims: bool = True
+    multicast_span: int = 1
+
+    def __post_init__(self) -> None:
+        if self.multicast_span < 0:
+            raise ValueError(
+                f"multicast_span is a column count, or 0 for none; got "
+                f"{self.multicast_span}"
+            )
+
+    @property
+    def aiecc_flags(self) -> tuple[str, ...]:
+        flags = ["--load-pdi-to-ctrl-pkt"]
+        if not self.adaptive_overlay:
+            flags.append("--ctrlpkt-adaptive-overlay=false")
+        if not self.parallel_shims:
+            flags.append("--ctrlpkt-parallel-shims=false")
+        if self.multicast_span != 1:
+            flags.append(f"--ctrlpkt-multicast-span={self.multicast_span}")
+        return tuple(flags)
+
+
 @dataclasses.dataclass
 class Plan:
     """What ``compile`` decided, and why."""
@@ -36,6 +80,7 @@ class Plan:
     values: list  # (name, kind, lowering)
     # The steps starting each command after the first, queued back to back.
     commands: tuple[int, ...] = ()
+    control_packets: ControlPackets | None = None
 
     def idle(self, steps, values) -> frozenset[int]:
         """Return the commands a call with ``values`` leaves without work.
@@ -87,12 +132,13 @@ def plan(
     full_elf: bool | None = None,
     check: bool = False,
     step_words: list[frozenset[str]] | None = None,
+    control_packets: ControlPackets | None = None,
 ) -> Plan:
     """Derive the packaging for ``recording`` on ``dev``, refusing a shipped image.
 
     ``full_elf=True`` where the device or ``check`` forbids it, or a step
     reading over ``SCRATCHPAD_WORDS`` (``step_words``, each step's by its
-    shared symbol).
+    shared symbol), and ``control_packets`` without a full ELF.
     """
     shipped = [op for op in recording.operators if op.external is not None]
     if shipped:
@@ -120,6 +166,13 @@ def plan(
         reasons = forced or ["one sequence, one configuration set: a full ELF"]
     else:
         reasons = [f"full_elf={full_elf}: asked for", *forced]
+    if control_packets is not None:
+        if not full_elf:
+            raise ValueError(
+                f"{recording.name}: control packets configure a full ELF's "
+                f"designs; this is an xclbin per step: " + "; ".join(reasons)
+            )
+        reasons.append(f"designs configured by control packets: {control_packets}")
 
     values = []
     for v in recording.values:
@@ -163,4 +216,4 @@ def plan(
                 f"a host step runs between commands: one starts at steps "
                 f"{sorted(hosted)}"
             )
-    return Plan(full_elf, reasons, values, tuple(commands))
+    return Plan(full_elf, reasons, values, tuple(commands), control_packets)

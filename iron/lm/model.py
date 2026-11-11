@@ -25,7 +25,7 @@ import numpy as np
 from aie.iron.device import Device
 
 import iron
-from iron.common.image.packaging import require_device
+from iron.common.image.packaging import ControlPackets, require_device
 
 from .checkpoint import Checkpoint, weights_file
 from .config import Config, DecoderConfig
@@ -306,16 +306,22 @@ class Model(iron.Graph):
         random_weights: int | None = None,
         max_seq_len: int | None = None,
         full_elf: bool | None = None,
+        control_packets: ControlPackets | None = None,
     ) -> Self:
         """``from_checkpoint``'s model compiled and loaded, weights uploaded.
 
-        ``full_elf`` is every version's packaging (``load_versions``).
+        ``full_elf`` and ``control_packets`` are every version's packaging
+        (``load_versions``).
         """
         model = cls.from_checkpoint(
             path, random_weights=random_weights, max_seq_len=max_seq_len
         )
         assert model.checkpoint is not None, "from_checkpoint gives it one"
-        return model.load_versions(release=model.checkpoint.release, full_elf=full_elf)
+        return model.load_versions(
+            release=model.checkpoint.release,
+            full_elf=full_elf,
+            control_packets=control_packets,
+        )
 
     @classmethod
     def from_checkpoint(
@@ -610,6 +616,7 @@ class Model(iron.Graph):
         release: Callable[[np.ndarray], None] | None = None,
         full_elf: bool | None = None,
         dev: Device | None = None,
+        control_packets: ControlPackets | None = None,
     ) -> Self:
         """Compile every version, then load each, in one arena, and hand them to ``loaded``.
 
@@ -620,6 +627,8 @@ class Model(iron.Graph):
             release: Given each piece of each weight once it is on the device.
             full_elf: Each version's packaging (``Graph.compile``).
             dev: The device every version compiles for, else the current one.
+            control_packets: How each full ELF configures its designs
+                (``Graph.compile``).
         """
         if dev is None:
             dev = require_device()
@@ -627,7 +636,11 @@ class Model(iron.Graph):
         for shapes in self.shapes():
             prompt = "ids" in shapes or "placed" in shapes
             version = self.compile(
-                dev=dev, feeds=decode if prompt else None, full_elf=full_elf, **shapes
+                dev=dev,
+                feeds=decode if prompt else None,
+                full_elf=full_elf,
+                control_packets=control_packets,
+                **shapes,
             )
             if not shapes and version.emit is not None:
                 decode = version
@@ -691,7 +704,9 @@ class OnHost:
         logits, carry = self.reference(*tensors, **values)
         return _HostOutput(logits), carry
 
-    def load_versions(self, *, release=None, full_elf=None, dev=None) -> Self:
+    def load_versions(
+        self, *, release=None, full_elf=None, dev=None, control_packets=None
+    ) -> Self:
         return self
 
 
